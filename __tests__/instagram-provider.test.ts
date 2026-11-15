@@ -347,3 +347,22 @@ it('treats a lost public-reply response as unconfirmed instead of safe to repeat
   await expect(sendCommentReply({ context, commentId: 'comment', postId: 'post', message: 'Thanks' })).rejects.toMatchObject({ name: 'ZernioDeliveryUnconfirmedError' });
   expect(fetchMock).toHaveBeenCalledTimes(2);
 });
+
+describe("subscribeInstagramAccountToWebhooks", () => {
+  it("subscribes to button taps as well as comments and messages", async () => {
+    const { subscribeInstagramAccountToWebhooks } = await import("@/lib/meta/client");
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ success: true }), { status: 200 })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      await subscribeInstagramAccountToWebhooks("17841400000000000", "token");
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.subscribed_fields).toEqual(
+        expect.arrayContaining(["comments", "messages", "messaging_postbacks"])
+      );
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});

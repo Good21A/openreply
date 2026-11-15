@@ -964,7 +964,11 @@ export async function subscribeInstagramAccountToWebhooks(
         Authorization: `Bearer ${accessToken}`,
       },
       body: JSON.stringify({
-        subscribed_fields: ["comments", "messages"],
+        // messaging_postbacks carries follow-gate and reveal button taps.
+        // Without it the first DM sends but every tap is silently dropped:
+        // the app-level webhook field alone is not enough, each account
+        // needs it in its own subscription.
+        subscribed_fields: ["comments", "messages", "messaging_postbacks"],
       }),
     }
   );
