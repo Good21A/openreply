@@ -85,6 +85,7 @@ model Workspace {
   linkClicks        LinkClick[]
   webhookEvents     WebhookEvent[]
   operationalEvents OperationalEvent[]
+  serviceKeys       ServiceKey[]
 
   @@index([ownerId])
 }
@@ -101,6 +102,21 @@ model WorkspaceMember {
 
   @@unique([workspaceId, userId])
   @@index([userId])
+}
+
+model ServiceKey {
+  id          String    @id @default(cuid())
+  workspaceId String
+  name        String
+  tokenHash   String    @unique
+  scopes      String[]
+  expiresAt   DateTime
+  revokedAt   DateTime?
+  createdAt   DateTime  @default(now())
+  lastUsedAt  DateTime?
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId])
 }
 
 model WorkspaceInvitation {
@@ -132,6 +148,10 @@ model InstagramAccount {
   username          String
   name              String?
   provider          InstagramProvider @default(META)
+  /// Which Meta setup issued the token, for META accounts. Existing rows are
+  /// INSTAGRAM: their tokens only work on graph.instagram.com. UNIFIED tokens
+  /// are business system user tokens that only work on graph.facebook.com.
+  metaLogin         MetaLogin @default(INSTAGRAM)
   zernioAccountId   String?
   accessToken       String
   tokenExpiresAt    DateTime?
@@ -401,6 +421,12 @@ enum OperationalEventLevel {
 enum InstagramProvider {
   META
   ZERNIO
+}
+
+/// Instagram Login (Business Login for Instagram) or Meta's Unified login.
+enum MetaLogin {
+  INSTAGRAM
+  UNIFIED
 }
 
 model ZernioConnection {
