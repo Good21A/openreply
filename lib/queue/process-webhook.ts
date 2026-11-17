@@ -9,13 +9,20 @@ type InstagramPayload = Parameters<typeof parseCommentEvents>[0];
 export async function processInstagramWebhook({ payload: incoming, provider, workspaceId }: {
   payload: InstagramPayload; provider: InstagramProvider; workspaceId?: string;
 }) {
-  if (incoming.object !== 'instagram' || !Array.isArray(incoming.entry)) return;
+  if (incoming.object !== 'instagram' || !Array.isArray(incoming.entry)) {
+    await logDroppedWebhook('object is not "instagram" or entry is missing', provider, workspaceId, incoming);
+    return;
+  }
   const accounts = await prisma.instagramAccount.findMany({
     where: { instagramId: { in: incoming.entry.map(e => e.id) }, provider, ...(workspaceId ? { workspaceId } : {}) },
     select: { id: true, instagramId: true, workspaceId: true },
   });
   const accountMap = new Map(accounts.map(a => [a.instagramId, a]));
   const allowed = new Set(accountMap.keys());
+  const dropped = incoming.entry.filter(e => !allowed.has(e.id));
+  if (dropped.length) {
+    await logDroppedWebhook('entry.id matches no connected account', provider, workspaceId, { ...incoming, entry: dropped });
+  }
   const payload = { ...incoming, entry: incoming.entry.filter(e => allowed.has(e.id)) };
   if (!payload.entry.length) return;
   const webhookEvent = await prisma.webhookEvent.create({
@@ -202,4 +209,26 @@ export async function processInstagramWebhook({ payload: incoming, provider, wor
 
     throw error;
   }
+}
+
+// Webhooks dropped above used to vanish without a trace while Meta still got a
+// 200, which hid why DM events never reached a campaign. Record them so the
+// payload Meta actually sent can be read back from OperationalEvent.
+async function logDroppedWebhook(
+  reason: string,
+  provider: InstagramProvider,
+  workspaceId: string | undefined,
+  payload: unknown,
+) {
+  await prisma.operationalEvent
+    .create({
+      data: {
+        source: 'SYSTEM',
+        level: 'WARNING',
+        message: `Webhook dropped: ${reason}`,
+        workspaceId: workspaceId ?? null,
+        payload: { provider, payload: payload as Prisma.InputJsonValue },
+      },
+    })
+    .catch(() => {});
 }
