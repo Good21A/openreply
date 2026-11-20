@@ -9,6 +9,7 @@ import {
   verifyWebhookSignature,
   parseCommentEvents,
   parseMessageEvents,
+  parsePostbackEvents,
   parseReadEvents,
 } from "../lib/meta/webhook";
 import { createHmac } from "crypto";
@@ -513,5 +514,85 @@ describe("parseReadEvents", () => {
     };
 
     expect(parseReadEvents(payload)).toHaveLength(0);
+  });
+});
+
+describe("messaging events delivered as entry.changes", () => {
+  // Shape of Meta's dashboard test event for a Unified login app.
+  function changesPayload(field: string, value: unknown) {
+    return {
+      object: "instagram",
+      entry: [{ id: "ig_456", time: 1, changes: [{ field, value }] }],
+    } as unknown as Parameters<typeof parseMessageEvents>[0];
+  }
+
+  it("parses an inbound DM from a messages change", () => {
+    const payload = changesPayload("messages", {
+      sender: { id: "user_999" },
+      recipient: { id: "ig_456" },
+      timestamp: "1527459824",
+      message: { mid: "mid_abc", text: "LINK" },
+    });
+
+    expect(parseMessageEvents(payload)).toEqual([
+      {
+        instagramAccountId: "ig_456",
+        messageId: "mid_abc",
+        messageText: "LINK",
+        senderId: "user_999",
+      },
+    ]);
+    expect(parseCommentEvents(payload)).toEqual([]);
+  });
+
+  it("parses a button tap from a messaging_postbacks change", () => {
+    const payload = changesPayload("messaging_postbacks", {
+      sender: { id: "user_999" },
+      recipient: { id: "ig_456" },
+      postback: { mid: "mid_pb", payload: "reveal:campaign1" },
+    });
+
+    expect(parsePostbackEvents(payload)).toEqual([
+      {
+        instagramAccountId: "ig_456",
+        userId: "user_999",
+        payload: "reveal:campaign1",
+        mid: "mid_pb",
+      },
+    ]);
+  });
+
+  it("parses a read receipt from a messaging_seen change", () => {
+    const payload = changesPayload("messaging_seen", {
+      sender: { id: "user_999" },
+      recipient: { id: "ig_456" },
+      read: { watermark: 42 },
+    });
+
+    expect(parseReadEvents(payload)).toEqual([
+      { instagramAccountId: "ig_456", userId: "user_999", watermark: 42 },
+    ]);
+  });
+
+  it("still skips echoes in a messages change", () => {
+    const payload = changesPayload("messages", {
+      sender: { id: "ig_456" },
+      recipient: { id: "user_999" },
+      message: { mid: "mid_echo", text: "LINK", is_echo: true },
+    });
+
+    expect(parseMessageEvents(payload)).toEqual([]);
+  });
+
+  it("does not read a comments change as a DM", () => {
+    const payload = changesPayload("comments", {
+      id: "c1",
+      text: "LINK",
+      from: { id: "user_999" },
+      media: { id: "m1" },
+    });
+
+    expect(parseMessageEvents(payload)).toEqual([]);
+    expect(parsePostbackEvents(payload)).toEqual([]);
   });
 });

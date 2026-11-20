@@ -71,20 +71,43 @@ interface WebhookEntry {
       media_id?: string;
     };
   }>;
-  messaging?: Array<{
-    sender?: { id?: string };
-    recipient?: { id?: string };
-    postback?: { mid?: string; title?: string; payload?: string };
-    read?: { watermark?: number; seq?: number };
-    message?: {
-      mid?: string;
-      text?: string;
-      is_echo?: boolean;
-      is_deleted?: boolean;
-      is_unsupported?: boolean;
-      attachments?: Array<{ type?: string }>;
-    };
-  }>;
+  messaging?: WebhookMessaging[];
+}
+
+interface WebhookMessaging {
+  sender?: { id?: string };
+  recipient?: { id?: string };
+  postback?: { mid?: string; title?: string; payload?: string };
+  read?: { watermark?: number; seq?: number };
+  message?: {
+    mid?: string;
+    text?: string;
+    is_echo?: boolean;
+    is_deleted?: boolean;
+    is_unsupported?: boolean;
+    attachments?: Array<{ type?: string }>;
+  };
+}
+
+// DM fields that can arrive as `entry.changes[]` instead of `entry.messaging[]`.
+// Meta's dashboard test event for a Unified login app sends `messages` this
+// way, with the messaging object as the change's value.
+const MESSAGING_CHANGE_FIELDS = new Set([
+  "messages",
+  "messaging_postbacks",
+  "messaging_seen",
+]);
+
+/**
+ * Every messaging item in an entry, from either payload shape: the classic
+ * `entry.messaging[]`, or `entry.changes[]` with a messaging field.
+ */
+function messagingItems(entry: WebhookEntry): WebhookMessaging[] {
+  const fromChanges = (entry.changes ?? [])
+    .filter((change) => MESSAGING_CHANGE_FIELDS.has(change.field))
+    .map((change) => change.value as unknown as WebhookMessaging)
+    .filter((value): value is WebhookMessaging => Boolean(value));
+  return [...(entry.messaging ?? []), ...fromChanges];
 }
 
 export interface WebhookMessageEvent {
@@ -173,7 +196,7 @@ export function parsePostbackEvents(
   if (payload.object !== "instagram") return events;
 
   for (const entry of payload.entry ?? []) {
-    for (const messaging of entry.messaging ?? []) {
+    for (const messaging of messagingItems(entry)) {
       const postbackPayload = messaging.postback?.payload;
       const userId = messaging.sender?.id;
       const accountId = entry.id ?? messaging.recipient?.id;
@@ -212,7 +235,7 @@ export function parseMessageEvents(
   if (payload.object !== "instagram") return events;
 
   for (const entry of payload.entry ?? []) {
-    for (const messaging of entry.messaging ?? []) {
+    for (const messaging of messagingItems(entry)) {
       const message = messaging.message;
       if (!message) continue;
       if (message.is_echo || message.is_deleted || message.is_unsupported) {
@@ -251,7 +274,7 @@ export function parseReadEvents(payload: WebhookPayload): WebhookReadEvent[] {
   if (payload.object !== "instagram") return events;
 
   for (const entry of payload.entry ?? []) {
-    for (const messaging of entry.messaging ?? []) {
+    for (const messaging of messagingItems(entry)) {
       if (!messaging.read) continue;
 
       const userId = messaging.sender?.id;
