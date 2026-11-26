@@ -12,9 +12,15 @@ vi.mock("@/lib/db/client", () => ({ prisma: {} }));
 vi.mock("@/lib/queue/client", () => ({
   getDMQueue: () => ({ add: vi.fn() }),
   POSTBACK_JOB_NAME: "process-postback",
+  MESSAGE_JOB_NAME: "process-message",
 }));
 
-import { findTaps, type PendingTap } from "../lib/polling/tap-poller";
+import {
+  findKeywordDms,
+  findTaps,
+  type DmCampaign,
+  type PendingTap,
+} from "../lib/polling/conversation-poller";
 
 const ACCOUNT = { username: "movewithells", id: "17841454405925967" };
 const USER = { username: "atchia.adam", id: "29787222810966599" };
@@ -117,5 +123,52 @@ describe("findTaps", () => {
       { id: "m9", at: "2026-11-26T05:30:00+0000", from: ACCOUNT, text: "Link" },
     ]);
     expect(findTaps([thread], [pending({ commenterId: USER.id })])).toEqual([]);
+  });
+});
+
+describe("findKeywordDms", () => {
+  const reformer: DmCampaign = {
+    keywords: ["reformer"],
+    matchAnyWord: false,
+    wholeWordMatch: true,
+  };
+  const NOT_BEFORE = Date.parse("2026-11-26T05:00:00Z");
+  const thread = conversation([
+    { id: "d3", at: "2026-11-26T05:31:00+0000", from: ACCOUNT, text: "Reformer link here" },
+    { id: "d2", at: "2026-11-26T05:30:00+0000", from: USER, text: "Hi, Reformer please!" },
+    { id: "d1", at: "2026-11-26T05:29:00+0000", from: USER, text: "Hello 1" },
+    { id: "d0", at: "2026-11-26T04:00:00+0000", from: USER, text: "reformer" },
+  ]);
+
+  it("finds an inbound DM carrying a keyword, skipping our own and old messages", () => {
+    expect(
+      findKeywordDms([thread], ACCOUNT.id, [reformer], new Set(), NOT_BEFORE)
+    ).toEqual([
+      { messageId: "d2", senderId: USER.id, text: "Hi, Reformer please!" },
+    ]);
+  });
+
+  it("answers every inbound DM for a match-any-word campaign", () => {
+    const ids = findKeywordDms(
+      [thread],
+      ACCOUNT.id,
+      [{ ...reformer, matchAnyWord: true }],
+      new Set(),
+      NOT_BEFORE
+    ).map((d) => d.messageId);
+    expect(ids).toEqual(["d2", "d1"]);
+  });
+
+  it("never treats a button tap as a keyword DM", () => {
+    const tapThread = conversation([
+      { id: "t1", at: "2026-11-26T05:30:00+0000", from: USER, text: "Reformer" },
+    ]);
+    expect(
+      findKeywordDms([tapThread], ACCOUNT.id, [reformer], new Set(["t1"]), NOT_BEFORE)
+    ).toEqual([]);
+  });
+
+  it("finds nothing without a DM campaign", () => {
+    expect(findKeywordDms([thread], ACCOUNT.id, [], new Set(), NOT_BEFORE)).toEqual([]);
   });
 });

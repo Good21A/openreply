@@ -1,19 +1,21 @@
 /**
- * Button taps read from conversations, for Unified login accounts.
+ * Button taps and keyword DMs read from conversations, for Unified login accounts.
  *
  * Meta does not deliver messaging webhooks (messages, messaging_postbacks) to
  * Unified login apps on Standard Access: comment webhooks arrive, but a tap on
- * the opening DM's button or the follow prompt's "I'm following" never reaches
- * the app, so every campaign that waits on a tap stalls. The tap still lands in
- * the conversation as a message whose text is the button's label, so it is
- * read from there and queued as the same postback job a webhook would queue.
+ * the opening DM's button or the follow prompt's "I'm following", and a DM
+ * carrying a campaign keyword, never reach the app. Both still land in the
+ * conversation, a tap as a message whose text is the button's label, so they
+ * are read from there and queued as the same jobs a webhook would queue.
  *
- * Only messages from people we sent a comment DM in the last 24 hours are
- * looked at, and only to compare their text with a button label. Nothing from
- * the conversations is stored except the id of a tap that was acted on.
+ * Taps are looked for only among people we sent a comment DM in the last 24
+ * hours. Keyword DMs are looked for, on accounts with a campaign that answers
+ * DMs, among all messages from the last hour; a message that is a tap is never
+ * also treated as a keyword DM. Message text is only compared in memory: nothing
+ * from the conversations is stored except the ids of the messages acted on.
  *
- * Adapted from kattilathubiyon-lab/openreply (lib/polling/confirmation-poller.ts),
- * extended to the follow prompt's button.
+ * Tap matching adapted from kattilathubiyon-lab/openreply
+ * (lib/polling/confirmation-poller.ts), extended to the follow prompt's button.
  */
 
 import { prisma } from "@/lib/db/client";
@@ -23,9 +25,17 @@ import {
   MetaApiError,
   type InstagramConversation,
 } from "@/lib/meta/client";
-import { getDMQueue, POSTBACK_JOB_NAME } from "@/lib/queue/client";
+import {
+  getDMQueue,
+  MESSAGE_JOB_NAME,
+  POSTBACK_JOB_NAME,
+} from "@/lib/queue/client";
+import { matchKeywords } from "@/lib/utils/keyword-matcher";
 
 const WINDOW_MS = 24 * 60 * 60 * 1000;
+// How far back a keyword DM is still answered. Bounds the first sweep after a
+// deploy or restart, so old DMs are not answered hours late.
+const DM_LOOKBACK_MS = 60 * 60 * 1000;
 // 25 conversations a page. A normal sweep reads one; the cap matters only when
 // catching up after an outage or a rate-limit pause.
 const MAX_PAGES = 20;
@@ -114,6 +124,51 @@ export function findTaps(
   return taps;
 }
 
+/** A campaign that answers DMs carrying its keywords (dmTriggerEnabled). */
+export interface DmCampaign {
+  keywords: string[];
+  matchAnyWord: boolean;
+  wholeWordMatch: boolean;
+}
+
+export interface KeywordDm {
+  messageId: string;
+  senderId: string;
+  text: string;
+}
+
+/**
+ * Inbound messages that at least one DM campaign would answer. processMessage
+ * matches them again per campaign, as it does for a webhook; this only keeps
+ * the rest from being queued. Our own messages, messages without text, button
+ * taps and anything older than `notBefore` are skipped.
+ */
+export function findKeywordDms(
+  conversations: InstagramConversation[],
+  accountInstagramId: string,
+  campaigns: DmCampaign[],
+  tapMessageIds: Set<string>,
+  notBefore: number
+): KeywordDm[] {
+  const found: KeywordDm[] = [];
+  for (const conversation of conversations) {
+    for (const message of conversation.messages?.data ?? []) {
+      const { id, from, created_time: createdTime } = message;
+      const text = message.message?.trim();
+      if (!id || !from?.id || !createdTime || !text) continue;
+      if (from.id === accountInstagramId || tapMessageIds.has(id)) continue;
+      if (Date.parse(createdTime) < notBefore) continue;
+      const matches = campaigns.some(
+        (c) =>
+          c.matchAnyWord ||
+          matchKeywords(text, c.keywords, c.wholeWordMatch).matched
+      );
+      if (matches) found.push({ messageId: id, senderId: from.id, text });
+    }
+  }
+  return found;
+}
+
 type PolledAccount = {
   id: string;
   workspaceId: string;
@@ -128,8 +183,11 @@ const lastSweep = new Map<string, number>();
 const pausedUntil = new Map<string, number>();
 let running = false;
 
-/** One sweep over every Unified login account with a campaign that waits on a tap. */
-export async function pollButtonTaps(now = Date.now()): Promise<void> {
+/**
+ * One sweep over every Unified login account with a campaign that waits on a
+ * tap or answers DMs.
+ */
+export async function pollConversations(now = Date.now()): Promise<void> {
   if (running) return;
   running = true;
   try {
@@ -140,7 +198,11 @@ export async function pollButtonTaps(now = Date.now()): Promise<void> {
         automations: {
           some: {
             isActive: true,
-            OR: [{ openingDmEnabled: true }, { requireFollow: true }],
+            OR: [
+              { openingDmEnabled: true },
+              { requireFollow: true },
+              { dmTriggerEnabled: true },
+            ],
           },
         },
       },
@@ -153,7 +215,7 @@ export async function pollButtonTaps(now = Date.now()): Promise<void> {
         if (error instanceof MetaApiError && RATE_LIMIT_CODES.has(error.code))
           pausedUntil.set(account.id, now + BACKOFF_MS);
         const detail = error instanceof Error ? error.message : "Unknown error";
-        console.error("[Tap Poll] Sweep failed:", detail);
+        console.error("[Conversation Poll] Sweep failed:", detail);
       }
     }
   } finally {
@@ -215,10 +277,25 @@ async function sweepAccount(account: PolledAccount, now: number): Promise<void> 
       },
     ];
   });
-  if (pending.length === 0) return;
+  const dmCampaigns: DmCampaign[] = await prisma.automation.findMany({
+    where: {
+      instagramAccountId: account.id,
+      isActive: true,
+      dmTriggerEnabled: true,
+    },
+    select: { keywords: true, matchAnyWord: true, wholeWordMatch: true },
+  });
+  if (pending.length === 0 && dmCampaigns.length === 0) return;
 
-  const oldest = Math.min(...pending.map((p) => p.sentAt.getTime()));
-  const since = Math.max(oldest, (lastSweep.get(account.id) ?? 0) - OVERLAP_MS);
+  const dmNotBefore = now - DM_LOOKBACK_MS;
+  const oldestOfInterest = Math.min(
+    ...pending.map((p) => p.sentAt.getTime()),
+    ...(dmCampaigns.length > 0 ? [dmNotBefore] : [])
+  );
+  const since = Math.max(
+    oldestOfInterest,
+    (lastSweep.get(account.id) ?? 0) - OVERLAP_MS
+  );
 
   const context = await createInstagramContext(account);
   if (context.provider !== "META") return;
@@ -232,8 +309,18 @@ async function sweepAccount(account: PolledAccount, now: number): Promise<void> 
       account.instagramId,
       after
     );
-    for (const tap of findTaps(result.conversations, pending))
-      await enqueueTap(account, tap);
+    const taps = findTaps(result.conversations, pending);
+    for (const tap of taps) await enqueueTap(account, tap);
+    if (dmCampaigns.length > 0) {
+      const dms = findKeywordDms(
+        result.conversations,
+        account.instagramId,
+        dmCampaigns,
+        new Set(taps.map((t) => t.messageId)),
+        dmNotBefore
+      );
+      for (const dm of dms) await enqueueKeywordDm(account, dm);
+    }
     // Conversations come newest first: stop at the first one older than `since`.
     const last = result.conversations.at(-1)?.updated_time;
     after = result.after;
@@ -245,7 +332,7 @@ async function sweepAccount(account: PolledAccount, now: number): Promise<void> 
   // Move on only once everything back to the last sweep was read; otherwise the
   // next sweep starts from the same point and nothing is skipped.
   if (covered) lastSweep.set(account.id, now);
-  else console.warn("[Tap Poll] Page cap reached, will catch up next sweep");
+  else console.warn("[Conversation Poll] Page cap reached, will catch up next sweep");
 }
 
 /**
@@ -293,5 +380,39 @@ async function enqueueTap(account: PolledAccount, tap: Tap): Promise<void> {
         },
       },
     })
+    .catch(() => {});
+}
+
+/**
+ * Queue a keyword DM exactly once, as the same job a messages webhook would
+ * produce. processMessage also dedupes per message id (DmLog dm:<id>); the
+ * claim here keeps a re-read message from being queued again after its job
+ * has left the queue.
+ */
+async function enqueueKeywordDm(
+  account: PolledAccount,
+  dm: KeywordDm
+): Promise<void> {
+  const claimId = `dm-poll:${dm.messageId}`;
+  if (await prisma.postbackDelivery.findUnique({ where: { id: claimId } }))
+    return;
+  await getDMQueue().add(
+    MESSAGE_JOB_NAME,
+    {
+      instagramAccountId: account.instagramId,
+      accountConnectionId: account.id,
+      messageId: dm.messageId,
+      messageText: dm.text,
+      senderId: dm.senderId,
+    },
+    {
+      // Same id the webhook path builds (lib/queue/process-webhook.ts).
+      jobId: `message_${account.instagramId}_${Buffer.from(
+        dm.messageId
+      ).toString("base64url")}`,
+    }
+  );
+  await prisma.postbackDelivery
+    .create({ data: { id: claimId } })
     .catch(() => {});
 }
