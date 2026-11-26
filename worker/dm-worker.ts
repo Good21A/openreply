@@ -1,6 +1,7 @@
 import { createDMWorker } from "@/lib/queue/dm-worker";
 import { recordWorkerHeartbeat } from "@/lib/ops/worker-health";
 import { reconcileComments } from "@/lib/polling/comment-reconciler";
+import { pollButtonTaps } from "@/lib/polling/tap-poller";
 import { attachPendingNextReels } from "@/lib/automation/attach-next-reel";
 import os from "node:os";
 
@@ -48,10 +49,27 @@ async function poll() {
 setTimeout(() => void poll(), 10_000);
 const pollTimer = setInterval(() => void poll(), POLL_INTERVAL_MS);
 
+// Button taps on Unified login accounts. Meta sends those apps no messaging
+// webhooks, so the taps are read from conversations instead. 0 turns it off.
+const TAP_POLL_INTERVAL_MS = Number(
+  process.env.TAP_POLL_INTERVAL_MS ?? 15_000
+);
+const tapPollTimer =
+  Number.isFinite(TAP_POLL_INTERVAL_MS) && TAP_POLL_INTERVAL_MS > 0
+    ? setInterval(() => {
+        pollButtonTaps().catch((error) => {
+          const message =
+            error instanceof Error ? error.message : "Unknown error";
+          console.error("[DM Worker] Button tap poll failed:", message);
+        });
+      }, Math.max(TAP_POLL_INTERVAL_MS, 5_000))
+    : undefined;
+
 async function shutdown(signal: string) {
   console.log(`[DM Worker] ${signal} received, closing worker`);
   clearInterval(heartbeatTimer);
   clearInterval(pollTimer);
+  clearInterval(tapPollTimer);
   await worker.close();
   process.exit(0);
 }

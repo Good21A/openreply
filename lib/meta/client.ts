@@ -680,6 +680,40 @@ export async function getConversations(
 }
 
 /**
+ * One page of conversations, most recently updated first, with each one's last
+ * few messages. Unlike getConversations this keeps more than the newest message,
+ * so a button tap followed by a typed message is still visible. `after` is the
+ * cursor for the next page, or undefined on the last page.
+ */
+export async function getRecentConversationPage(
+  auth: MetaAuth,
+  igUserId: string,
+  after?: string
+): Promise<{ conversations: InstagramConversation[]; after?: string }> {
+  const url = new URL(`${instagramGraphBase(auth)}/${igUserId}/conversations`);
+  url.searchParams.set("platform", "instagram");
+  url.searchParams.set(
+    "fields",
+    "updated_time,messages.limit(6){id,message,from,created_time}"
+  );
+  url.searchParams.set("limit", "25");
+  if (after) url.searchParams.set("after", after);
+  const page = await handleResponse<{
+    data?: InstagramConversation[];
+    paging?: { next?: string; cursors?: { after?: string } };
+  }>(
+    await fetch(url.toString(), {
+      headers: { Authorization: `Bearer ${tokenOf(auth)}` },
+      signal: AbortSignal.timeout(10_000),
+    })
+  );
+  return {
+    conversations: page.data ?? [],
+    after: page.paging?.next ? page.paging.cursors?.after : undefined,
+  };
+}
+
+/**
  * The messages in a conversation, with content. Meta only returns full details
  * for the 20 most recent messages, newest first.
  */
